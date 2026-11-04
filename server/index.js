@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import { randomUUID, randomBytes } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { CHAMPS, ITEMS, makeBuild, cast, update } from './game.js';
 
@@ -21,9 +21,7 @@ const io = new Server(server, { cors: { origin: true } });
 const db = new Database(process.env.DB_FILE || 'proje1.sqlite');
 const secret = process.env.JWT_SECRET;
 
-if (!secret) {
-  throw new Error('JWT_SECRET ortam değişkeni tanımlanmalı');
-}
+if (!secret) throw new Error('JWT_SECRET ortam değişkeni tanımlanmalı');
 
 app.use(cors());
 app.use(express.json());
@@ -254,7 +252,7 @@ io.on('connection', socket => {
 
   try {
    attach(room);
-   ack({ ok: true, room: view(room) });
+   ack({ ok: true, room: view(room), playerId: ident.id });
   } catch (error) {
    rooms.delete(room.code);
    ack({ error: error.message });
@@ -270,7 +268,7 @@ io.on('connection', socket => {
 
   try {
    attach(room);
-   ack({ ok: true, room: view(room) });
+   ack({ ok: true, room: view(room), playerId: ident.id });
   } catch (error) {
    ack({ error: error.message });
   }
@@ -281,9 +279,7 @@ io.on('connection', socket => {
   const p = room?.players[socket.data.pid];
 
   try {
-   if (!p || room.status !== 'lobby') {
-    throw Error('Lobi kapalı');
-   }
+   if (!p || room.status !== 'lobby') throw Error('Lobi kapalı');
 
    const build = makeBuild(champId, items);
 
@@ -474,16 +470,19 @@ io.on('connection', socket => {
   p.disconnectedAt = Date.now();
 
   const resumeToken = randomBytes(32).toString('hex');
+  const tokenHash = createHash('sha256').update(resumeToken).digest('hex');
 
-  resumes.set(resumeToken, {
+  resumes.set(tokenHash, {
    room: room.code,
    id: p.id,
    expires: Date.now() + 30000
   });
 
-  // Token rakibe gönderilmez. Oyuncunun kendi tarayıcısına
-  // daha önceden güvenli şekilde kaydedilmiş olmalıdır.
-  p.resumeTokenHash = resumeToken;
+  // Token yalnızca kopan oyuncunun tarayıcısına önceden
+  // güvenli şekilde kaydedilmişse kullanılabilir.
+  // Bu sürümde istemci entegrasyonu henüz tamamlanmadı.
+  p.resumeTokenHash = tokenHash;
+
   io.to(room.code).emit('player:disconnected', {
    id: p.id,
    graceMs: 30000
@@ -491,7 +490,11 @@ io.on('connection', socket => {
  });
 
  socket.on('session:resume', ({ resumeToken } = {}, ack = () => {}) => {
-  const v = resumes.get(resumeToken);
+  const tokenHash = typeof resumeToken === 'string'
+   ? createHash('sha256').update(resumeToken).digest('hex')
+   : '';
+
+  const v = resumes.get(tokenHash);
   const room = v && rooms.get(v.room);
   const p = room?.players[v.id];
 
@@ -500,12 +503,12 @@ io.on('connection', socket => {
    v.expires < Date.now() ||
    !p ||
    !p.disconnected ||
-   p.resumeTokenHash !== resumeToken
+   p.resumeTokenHash !== tokenHash
   ) {
    return ack({ error: 'Geri dönüş süresi doldu' });
   }
 
-  resumes.delete(resumeToken);
+  resumes.delete(tokenHash);
   delete p.resumeTokenHash;
   p.socket = socket.id;
   p.disconnected = false;
@@ -523,7 +526,7 @@ io.on('connection', socket => {
 setInterval(() => {
  const now = Date.now();
 
- for (const room of rooms.values()) {
+ for (const room of [...rooms.values()]) {
   if (room.status === 'battle') {
    update(room, now);
 
@@ -556,16 +559,17 @@ setInterval(() => {
   }
 
   for (const [id, p] of Object.entries(room.players)) {
-   if (
-    p.disconnected &&
-    now - (p.disconnectedAt || now) > 30000
-   ) {
+   if (p.disconnected && now - (p.disconnectedAt || now) > 30000) {
     removePlayer(room, id);
 
     if (rooms.has(room.code)) broadcast(room);
     break;
    }
   }
+ }
+
+ for (const [token, value] of resumes) {
+  if (value.expires < now) resumes.delete(token);
  }
 }, 200);
 
